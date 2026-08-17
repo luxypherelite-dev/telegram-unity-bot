@@ -23,7 +23,9 @@ from typing import Any, Iterable
 import UnityPy
 import texture2ddecoder  # noqa: F401  # registers supported texture decoders
 from PIL import Image, UnidentifiedImageError
-from telegram import Document, Update
+import traceback
+
+from telegram import BotCommand, Document, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -41,10 +43,21 @@ MAX_VIEW_ITEMS = int(os.environ.get("MAX_VIEW_ITEMS", "200"))
 HEALTH_PORT = int(os.environ.get("PORT", "8080"))
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
+# ---------------------------------------------------------------------------
+# Structured logging configuration
+# ---------------------------------------------------------------------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_FORMAT = os.environ.get(
+    "LOG_FORMAT",
+    "%(asctime)s | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s",
 )
+logging.basicConfig(format=LOG_FORMAT, level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("telegram-unity-bot")
+
+# Reduce noise from third-party libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 # A lock prevents two commands from serializing the same UnityPy environment at once.
 SESSION_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
@@ -536,13 +549,72 @@ async def clear_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled update error", exc_info=context.error)
+    """Log unhandled errors with full structured context for debugging."""
+    error = context.error
+    # Build structured log payload
+    log_data = {
+        "error_type": type(error).__name__ if error else "Unknown",
+        "error_message": str(error) if error else "No error info",
+        "user_id": None,
+        "chat_id": None,
+        "command": None,
+        "message_text": None,
+    }
+    if isinstance(update, Update):
+        if update.effective_user:
+            log_data["user_id"] = update.effective_user.id
+        if update.effective_chat:
+            log_data["chat_id"] = update.effective_chat.id
+        if update.effective_message:
+            log_data["message_text"] = (update.effective_message.text or "")[:200]
+            if update.effective_message.text and update.effective_message.text.startswith("/"):
+                log_data["command"] = update.effective_message.text.split()[0]
+
+    # Log full traceback with context
+    tb_str = "".join(traceback.format_exception(type(error), error, error.__traceback__)) if error else "N/A"
+    logger.error(
+        "Unhandled exception | user=%(user_id)s | chat=%(chat_id)s | command=%(command)s | "
+        "error_type=%(error_type)s | error_message=%(error_message)s",
+        log_data,
+    )
+    logger.debug("Full traceback:\n%s", tb_str)
+
     if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text("An unexpected error occurred. Check the bot logs for details.")
+        await update.effective_message.reply_text(
+            f"\u26a0\ufe0f An error occurred: {type(error).__name__}. The issue has been logged."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bot command definitions for Telegram auto-complete menu
+# ---------------------------------------------------------------------------
+BOT_COMMANDS = [
+    BotCommand("start", "Show welcome message and usage guide"),
+    BotCommand("help", "Display all available commands"),
+    BotCommand("session", "Manage sessions: create, switch, list, delete"),
+    BotCommand("view", "List Texture2D assets in the active bundle"),
+    BotCommand("export", "Export all textures as PNG zip"),
+    BotCommand("export_raw", "Dump raw binary asset streams as zip"),
+    BotCommand("replace", "Batch-replace textures from a PNG zip"),
+    BotCommand("replace_one", "Replace a single texture (reply to PNG)"),
+    BotCommand("clear", "Clear cached files in the active session"),
+]
+
+
+async def post_init(application: Application) -> None:
+    """Register bot commands with Telegram for auto-complete suggestions."""
+    await application.bot.set_my_commands(BOT_COMMANDS)
+    logger.info("Registered %d bot commands for auto-complete menu", len(BOT_COMMANDS))
 
 
 def build_application() -> Application:
-    application = Application.builder().token(BOT_TOKEN).concurrent_updates(False).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(False)
+        .post_init(post_init)
+        .build()
+    )
     application.add_handler(CommandHandler(["start", "help"], start))
     application.add_handler(CommandHandler("session", session_command))
     application.add_handler(CommandHandler("view", view_assets))
