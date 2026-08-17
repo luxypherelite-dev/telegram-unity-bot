@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: telegram-unity-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: BOT_DATA_DIR
+        value: /var/data/telegram-unity-bot

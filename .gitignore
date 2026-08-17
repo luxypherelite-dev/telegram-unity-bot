@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+users/
+telegram-unity-bot-data/
+*.log
+.DS_Store
