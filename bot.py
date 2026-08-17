@@ -178,44 +178,278 @@ def require_active(user_id: int) -> tuple[str, Path, Path]:
     return name, session, bundle
 
 
+# ---------------------------------------------------------------------------
+# Universal Unity version extraction engine (Unity 3.x through Unity 6+)
+# Handles UnityFS/LZ4/LZMA compression, missing TypeTrees, nested containers
+# ---------------------------------------------------------------------------
+def load_unity_env(bundle_file: Path) -> Any:
+    """Load a Unity bundle with UnityPy, handling all compression formats.
+
+    UnityPy.load() automatically detects and decompresses UnityFS (LZ4/LZMA)
+    bundles, raw .assets files, and split resource files. This wrapper ensures
+    proper error reporting if the file cannot be parsed.
+    """
+    try:
+        env = UnityPy.load(str(bundle_file))
+    except Exception as exc:
+        logger.error(
+            "Failed to load bundle '%s': %s (%s)",
+            bundle_file.name, exc, type(exc).__name__,
+        )
+        raise ValueError(
+            f"Could not parse '{bundle_file.name}'. "
+            f"Ensure it is a valid Unity bundle/assets file. Error: {exc}"
+        ) from exc
+
+    # Validate that UnityPy found content (empty = likely unsupported compression)
+    obj_count = sum(1 for _ in env.objects)
+    if obj_count == 0:
+        # Attempt to check if files were at least detected
+        file_count = len(getattr(env, "files", {}) or {})
+        logger.warning(
+            "Bundle '%s' loaded but contains 0 objects (%d files detected). "
+            "Possibly unsupported compression or empty bundle.",
+            bundle_file.name, file_count,
+        )
+    else:
+        logger.info(
+            "Loaded bundle '%s': %d objects across %d file(s)",
+            bundle_file.name, obj_count, len(getattr(env, "files", {}) or {}),
+        )
+    return env
+
+
+def _try_read_object(obj: Any) -> Any | None:
+    """Attempt to read a Unity object with multiple fallback strategies.
+
+    Strategy order:
+    1. Standard obj.read() — works when TypeTree is present
+    2. obj.read_typetree() — forces TypeTree-based reading
+    3. Dictionary parsing — for stripped/missing TypeTrees
+    """
+    # Strategy 1: Standard read
+    try:
+        data = obj.read()
+        if data is not None:
+            return data
+    except Exception as exc:
+        logger.debug(
+            "Standard read failed for object path_id=%s type=%s: %s",
+            getattr(obj, "path_id", "?"), getattr(obj.type, "name", "?"), exc,
+        )
+
+    # Strategy 2: TypeTree read (some versions need explicit call)
+    try:
+        if hasattr(obj, "read_typetree"):
+            data = obj.read_typetree()
+            if data is not None:
+                return data
+    except Exception as exc:
+        logger.debug(
+            "TypeTree read failed for path_id=%s: %s",
+            getattr(obj, "path_id", "?"), exc,
+        )
+
+    # Strategy 3: Dictionary/raw parsing for stripped TypeTrees
+    try:
+        if hasattr(obj, "parse_as_dict"):
+            data = obj.parse_as_dict()
+            if data is not None:
+                return data
+    except Exception as exc:
+        logger.debug(
+            "Dict parse failed for path_id=%s: %s",
+            getattr(obj, "path_id", "?"), exc,
+        )
+
+    try:
+        if hasattr(obj, "parse_as_object"):
+            data = obj.parse_as_object()
+            if data is not None:
+                return data
+    except Exception as exc:
+        logger.debug(
+            "Object parse failed for path_id=%s: %s",
+            getattr(obj, "path_id", "?"), exc,
+        )
+
+    return None
+
+
+def _is_texture2d(obj: Any) -> bool:
+    """Check if an object is a Texture2D, handling various Unity versions."""
+    try:
+        type_name = getattr(obj.type, "name", None) or ""
+        if type_name == "Texture2D":
+            return True
+        # Some versions use class_id instead of name
+        class_id = getattr(obj, "class_id", None)
+        if class_id == 28:  # Texture2D class ID in Unity
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def get_texture_entries(env: Any) -> list[tuple[Any, Any]]:
+    """Recursively crawl all objects across all files and containers.
+
+    Handles:
+    - Top-level objects in env.objects
+    - Nested assets in sub-containers (env.files)
+    - Objects accessible via container paths
+    - Missing TypeTree fallback parsing
+    """
     entries = []
+    seen_ids: set[int] = set()  # Avoid duplicates from multiple access paths
+
+    def _process_object(obj: Any) -> None:
+        """Process a single object, attempting to read it as Texture2D."""
+        obj_id = id(obj)
+        if obj_id in seen_ids:
+            return
+        seen_ids.add(obj_id)
+
+        if not _is_texture2d(obj):
+            return
+
+        data = _try_read_object(obj)
+        if data is None:
+            logger.warning(
+                "Could not read Texture2D path_id=%s (all parse strategies failed)",
+                getattr(obj, "path_id", "unknown"),
+            )
+            return
+        entries.append((obj, data))
+
+    # Pass 1: Iterate all objects directly (covers most cases)
     for obj in env.objects:
         try:
-            if obj.type.name == "Texture2D":
-                data = obj.read()
-                entries.append((obj, data))
-        except Exception:
-            logger.exception("Skipping unreadable object")
+            _process_object(obj)
+        except Exception as exc:
+            logger.debug("Error processing object: %s", exc)
+
+    # Pass 2: Recursively crawl sub-files/containers for nested assets
+    files = getattr(env, "files", None)
+    if files:
+        file_collection = files.values() if isinstance(files, dict) else files
+        for sub_file in file_collection:
+            sub_objects = getattr(sub_file, "objects", None)
+            if sub_objects:
+                obj_iter = sub_objects.values() if isinstance(sub_objects, dict) else sub_objects
+                for obj in obj_iter:
+                    try:
+                        _process_object(obj)
+                    except Exception as exc:
+                        logger.debug("Error in sub-file object: %s", exc)
+
+    # Pass 3: Check container paths (some Unity builds nest textures in asset maps)
+    container = getattr(env, "container", None)
+    if container:
+        container_items = container.items() if isinstance(container, dict) else []
+        for path, obj_info in container_items:
+            try:
+                obj = getattr(obj_info, "asset", None) or obj_info
+                if hasattr(obj, "type"):
+                    _process_object(obj)
+            except Exception as exc:
+                logger.debug("Error in container path '%s': %s", path, exc)
+
+    if not entries:
+        logger.warning(
+            "No Texture2D assets found after exhaustive crawl "
+            "(checked %d unique objects)",
+            len(seen_ids),
+        )
+
     return entries
 
 
 def texture_name(obj: Any, data: Any) -> str:
+    """Extract texture name with multiple fallback paths."""
+    # Try standard name fields
     name = getattr(data, "m_Name", None) or getattr(data, "name", None)
-    return str(name) if name else f"Asset_{getattr(obj, 'path_id', 'unknown')}"
+    if name and str(name).strip():
+        return str(name)
+
+    # Try dictionary-style access (for dict-parsed objects)
+    if isinstance(data, dict):
+        name = data.get("m_Name") or data.get("name")
+        if name and str(name).strip():
+            return str(name)
+
+    # Try container path as name source
+    container_path = getattr(obj, "container", None)
+    if container_path:
+        return Path(str(container_path)).stem
+
+    return f"Asset_{getattr(obj, 'path_id', 'unknown')}"
 
 
 def decode_image(data: Any) -> Image.Image | None:
+    """Decode a Texture2D to PIL Image with fallback for various formats."""
+    # Standard .image property (works for most versions)
     try:
         image = data.image
-        return image.convert("RGBA") if image.mode != "RGBA" else image
-    except Exception:
-        return None
+        if image is not None:
+            return image.convert("RGBA") if image.mode != "RGBA" else image
+    except Exception as exc:
+        logger.debug("Standard image decode failed: %s", exc)
+
+    # Fallback: try to manually decode from raw image data
+    try:
+        width = getattr(data, "m_Width", 0) or 0
+        height = getattr(data, "m_Height", 0) or 0
+        image_data = getattr(data, "image_data", None)
+        if width > 0 and height > 0 and image_data:
+            # Attempt to create image from raw RGBA bytes
+            if len(image_data) == width * height * 4:
+                image = Image.frombytes("RGBA", (width, height), bytes(image_data))
+                return image
+    except Exception as exc:
+        logger.debug("Manual image decode fallback failed: %s", exc)
+
+    return None
 
 
 def raw_asset_bytes(obj: Any, data: Any) -> bytes:
+    """Extract raw binary data from a texture object with multiple strategies."""
+    # Strategy 1: get_raw_data method
     getter = getattr(obj, "get_raw_data", None)
     if callable(getter):
-        raw = getter()
-        if isinstance(raw, (bytes, bytearray)):
-            return bytes(raw)
+        try:
+            raw = getter()
+            if isinstance(raw, (bytes, bytearray)) and len(raw) > 0:
+                return bytes(raw)
+        except Exception:
+            pass
+
+    # Strategy 2: image_data attribute
     raw = getattr(data, "image_data", None)
-    if isinstance(raw, (bytes, bytearray)):
+    if isinstance(raw, (bytes, bytearray)) and len(raw) > 0:
         return bytes(raw)
+
+    # Strategy 3: m_StreamData or raw reader
+    stream_data = getattr(data, "m_StreamData", None)
+    if stream_data:
+        raw = getattr(stream_data, "data", None)
+        if isinstance(raw, (bytes, bytearray)) and len(raw) > 0:
+            return bytes(raw)
+
+    # Strategy 4: Read from object's raw bytes
+    try:
+        if hasattr(obj, "get_raw_data"):
+            raw = obj.get_raw_data()
+            if raw:
+                return bytes(raw)
+    except Exception:
+        pass
+
     raise ValueError("No raw stream is available for this asset")
 
 
 def find_texture(env: Any, requested: str) -> tuple[Any, Any] | None:
+    """Find a texture by name or path_id with case-insensitive matching."""
     requested_lower = requested.casefold()
     matches = []
     for obj, data in get_texture_entries(env):
@@ -448,7 +682,7 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 if not bundle:
                     await send_text(update, "No bundle loaded in this session to replace textures in.")
                     return
-                env = UnityPy.load(str(bundle))
+                env = load_unity_env(bundle)
                 textures = get_texture_entries(env)
                 by_name = {texture_name(obj, data).casefold(): (obj, data) for obj, data in textures}
                 by_id = {str(obj.path_id): (obj, data) for obj, data in textures}
@@ -549,7 +783,7 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     try:
         async with session_lock(user_id, name):
-            env = UnityPy.load(str(bundle))
+            env = load_unity_env(bundle)
             entries = get_texture_entries(env)
             lines = []
             for obj, data in entries[:MAX_VIEW_ITEMS]:
@@ -588,7 +822,7 @@ async def export_assets(update: Update, raw: bool) -> None:
     archive = work / archive_name
     try:
         async with session_lock(user_id, name):
-            env = UnityPy.load(str(bundle))
+            env = load_unity_env(bundle)
             entries = get_texture_entries(env)
             count = 0
             with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -648,7 +882,7 @@ async def process_replace_archive(update: Update, context: ContextTypes.DEFAULT_
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(custom_path=archive_path)
         async with session_lock(user_id, name):
-            env = UnityPy.load(str(bundle))
+            env = load_unity_env(bundle)
             textures = get_texture_entries(env)
             by_name = {texture_name(obj, data).casefold(): (obj, data) for obj, data in textures}
             by_id = {str(obj.path_id): (obj, data) for obj, data in textures}
@@ -706,7 +940,7 @@ async def replace_one(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     try:
         async with session_lock(user_id, name):
-            env = UnityPy.load(str(bundle))
+            env = load_unity_env(bundle)
             target = find_texture(env, requested)
             if not target:
                 await send_text(update, f"Texture '{requested}' was not found. Use /view for exact names.")
