@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import httpx
 import UnityPy
 import texture2ddecoder  # noqa: F401  # registers supported texture decoders
 from PIL import Image, UnidentifiedImageError
@@ -42,6 +43,16 @@ MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "25"))
 MAX_VIEW_ITEMS = int(os.environ.get("MAX_VIEW_ITEMS", "200"))
 HEALTH_PORT = int(os.environ.get("PORT", "10000"))
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
+
+# Regex to detect URLs in text messages (supports common file-hosting services)
+URL_PATTERN = re.compile(
+    r"https?://[^\s<>\"']+\.(?:bundle|assets|unity3d|resS|resource|zip)"
+    r"|https?://(?:drive\.google\.com|docs\.google\.com|mega\.nz|github\.com"
+    r"|raw\.githubusercontent\.com|dropbox\.com|mediafire\.com|cdn\.discordapp\.com"
+    r"|discord\.com/attachments)[^\s<>\"']*",
+    re.IGNORECASE,
+)
+MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_BYTES", str(500 * 1024 * 1024)))  # 500 MB
 
 # ---------------------------------------------------------------------------
 # Structured logging configuration
@@ -231,6 +242,8 @@ HELP_TEXT = """Unity Texture Bot
 
 Upload a Unity .bundle or .assets file after creating or switching to a session. The bot works only with Texture2D assets, as in the reference NOT UABE project.
 
+You can also paste a direct download link (Google Drive, GitHub Releases, Dropbox, Mega, Discord CDN, etc.) to load bundles larger than 20 MB — bypasses Telegram's file size limit!
+
 Session commands:
 /session create <name> — create and select a workspace
 /session switch <name> — select an existing workspace
@@ -306,6 +319,188 @@ async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         write_state(user_id, state)
         SESSION_LOCKS.pop((user_id, name), None)
         await send_text(update, f"Deleted session '{name}' and its files.")
+
+
+# ---------------------------------------------------------------------------
+# URL-based file download (bypasses Telegram's 20 MB limit)
+# ---------------------------------------------------------------------------
+def extract_filename_from_url(url: str) -> str:
+    """Try to extract a meaningful filename from a URL."""
+    from urllib.parse import urlparse, unquote
+    parsed = urlparse(url)
+    path = unquote(parsed.path)
+    name = Path(path).name if path else ""
+    # Strip query params from name
+    name = name.split("?")[0]
+    if not name or "." not in name:
+        return "download.bundle"
+    return safe_filename(name, "download.bundle")
+
+
+def resolve_google_drive_url(url: str) -> str:
+    """Convert a Google Drive share/view link to a direct download URL."""
+    # Handle /file/d/FILE_ID/ pattern
+    match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if match:
+        file_id = match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+    # Handle ?id=FILE_ID pattern
+    match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if match:
+        file_id = match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+    return url
+
+
+def resolve_dropbox_url(url: str) -> str:
+    """Convert Dropbox share link to direct download."""
+    if "dropbox.com" in url:
+        url = re.sub(r"[?&]dl=0", "?dl=1", url)
+        if "dl=1" not in url:
+            url += "&dl=1" if "?" in url else "?dl=1"
+    return url
+
+
+def resolve_download_url(url: str) -> str:
+    """Resolve known hosting services to direct download URLs."""
+    if "drive.google.com" in url or "docs.google.com" in url:
+        return resolve_google_drive_url(url)
+    if "dropbox.com" in url:
+        return resolve_dropbox_url(url)
+    return url
+
+
+async def download_from_url(url: str, destination: Path) -> int:
+    """Download a file from a URL with streaming. Returns bytes written."""
+    resolved_url = resolve_download_url(url)
+    total_bytes = 0
+    async with httpx.AsyncClient(follow_redirects=True, timeout=300.0) as client:
+        async with client.stream("GET", resolved_url) as response:
+            response.raise_for_status()
+            # Check content-length if available
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"File too large: {int(content_length) // (1024*1024)} MB "
+                    f"(limit: {MAX_DOWNLOAD_BYTES // (1024*1024)} MB)"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with open(destination, "wb") as f:
+                async for chunk in response.aiter_bytes(chunk_size=65536):
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"Download exceeded {MAX_DOWNLOAD_BYTES // (1024*1024)} MB limit"
+                        )
+                    f.write(chunk)
+    return total_bytes
+
+
+async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages containing URLs to bundle files."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not message.text:
+        return
+
+    # Find URLs in the message
+    urls = URL_PATTERN.findall(message.text)
+    if not urls:
+        return
+
+    url = urls[0]  # Process the first matched URL
+
+    try:
+        name, session, _ = require_active(user.id)
+    except RuntimeError:
+        # If no bundle exists yet, just need an active session
+        session_name, session_dir = active_session(user.id)
+        if not session_name or not session_dir:
+            await send_text(update, "No active session. Create one first with /session create <name>.")
+            return
+        name = session_name
+        session = session_dir
+
+    filename = extract_filename_from_url(url)
+    # Ensure it has a valid Unity extension, default to .bundle if not
+    valid_extensions = (".bundle", ".assets", ".unity3d", ".ress", ".resource", ".zip")
+    if not filename.lower().endswith(valid_extensions):
+        filename = filename + ".bundle"
+
+    await send_text(update, f"\u2b07\ufe0f Downloading from URL...\nFile: {filename}")
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+    destination = session / "input" / filename
+    try:
+        total = await download_from_url(url, destination)
+        size_mb = total / (1024 * 1024)
+        logger.info(
+            "Downloaded %.1f MB from URL for user %s session '%s': %s",
+            size_mb, user.id, name, url[:100],
+        )
+
+        # If it's a zip for replacement context, handle differently
+        if filename.lower().endswith(".zip") and context.user_data.get("pending_upload") == "replace":
+            await send_text(update, f"\u2705 Downloaded {size_mb:.1f} MB. Processing as replacement archive...")
+            # Simulate the replacement flow
+            async with session_lock(user.id, name):
+                bundle = bundle_path(session)
+                if not bundle:
+                    await send_text(update, "No bundle loaded in this session to replace textures in.")
+                    return
+                env = UnityPy.load(str(bundle))
+                textures = get_texture_entries(env)
+                by_name = {texture_name(obj, data).casefold(): (obj, data) for obj, data in textures}
+                by_id = {str(obj.path_id): (obj, data) for obj, data in textures}
+                replaced: list[str] = []
+                skipped: list[str] = []
+                with zipfile.ZipFile(destination) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir() or not info.filename.casefold().endswith(".png"):
+                            continue
+                        target = None
+                        for candidate in archive_candidates(Path(info.filename).name):
+                            target = by_name.get(candidate) or by_id.get(candidate)
+                            if target:
+                                break
+                        if not target:
+                            skipped.append(Path(info.filename).name)
+                            continue
+                        try:
+                            image = Image.open(io.BytesIO(zf.read(info))).convert("RGBA")
+                            target[1].image = image
+                            target[1].save()
+                            replaced.append(texture_name(*target))
+                        except (UnidentifiedImageError, OSError, ValueError) as exc:
+                            logger.warning("Skipping replacement %s: %s", info.filename, exc)
+                            skipped.append(Path(info.filename).name)
+                if replaced:
+                    bundle.write_bytes(env.file.save())
+            context.user_data.pop("pending_upload", None)
+            report = f"Replaced {len(replaced)} texture(s) in '{name}'."
+            if skipped:
+                report += f" Skipped {len(skipped)} unmatched or invalid PNG(s)."
+            await send_text(update, report)
+        else:
+            # Treat as a bundle upload
+            save_metadata(session, {
+                **load_metadata(session),
+                "bundle": destination.relative_to(session).as_posix(),
+                "uploaded_at": now_iso(),
+                "source_url": url[:500],
+            })
+            context.user_data.pop("pending_upload", None)
+            await send_text(
+                update,
+                f"\u2705 Downloaded {size_mb:.1f} MB into session '{name}'.\n"
+                f"File: {filename}\nUse /view, /export, or /replace."
+            )
+    except httpx.HTTPStatusError as exc:
+        logger.error("HTTP error downloading %s: %s", url[:100], exc)
+        await send_text(update, f"\u274c Download failed: HTTP {exc.response.status_code}. Check the URL is a direct download link.")
+    except (httpx.RequestError, ValueError, OSError) as exc:
+        logger.error("Download error for %s: %s", url[:100], exc)
+        await send_text(update, f"\u274c Download failed: {exc}")
 
 
 async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -624,6 +819,11 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("replace_one", replace_one))
     application.add_handler(CommandHandler("clear", clear_session))
     application.add_handler(MessageHandler(filters.Document.ALL, receive_document))
+    # URL handler: detect links in text messages (must come after command handlers)
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(URL_PATTERN),
+        handle_url_message,
+    ))
     application.add_error_handler(error_handler)
     return application
 

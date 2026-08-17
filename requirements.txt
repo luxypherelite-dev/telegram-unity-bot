@@ -2,3 +2,4 @@ python-telegram-bot>=20.7,<22
 UnityPy>=1.23.0
 Pillow>=10.0.0
 texture2ddecoder>=1.0.4
+httpx>=0.27.0
