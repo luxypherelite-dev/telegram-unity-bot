@@ -21,6 +21,6 @@ RUN useradd --create-home --uid 10001 botuser \
     && chown -R botuser:botuser /app /var/lib/telegram-unity-bot
 USER botuser
 
-EXPOSE 8080
+EXPOSE 10000
 
 CMD ["python", "bot.py"]

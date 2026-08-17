@@ -10,6 +10,6 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: PORT
-        value: "8080"
+        value: "10000"
       - key: BOT_DATA_DIR
         value: /var/data/telegram-unity-bot

@@ -40,7 +40,7 @@ DATA_ROOT = Path(os.environ.get("BOT_DATA_DIR", "/tmp/telegram-unity-bot")).reso
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "25"))
 MAX_VIEW_ITEMS = int(os.environ.get("MAX_VIEW_ITEMS", "200"))
-HEALTH_PORT = int(os.environ.get("PORT", "8080"))
+HEALTH_PORT = int(os.environ.get("PORT", "10000"))
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
 
 # ---------------------------------------------------------------------------
@@ -629,27 +629,29 @@ def build_application() -> Application:
 
 
 # ---------------------------------------------------------------------------
-# Lightweight Flask health-check server for Render Web Service (free tier)
+# Lightweight HTTP keep-alive server for Render Web Service
+# Uses stdlib http.server — no extra dependencies required.
 # ---------------------------------------------------------------------------
 def start_health_server() -> None:
-    """Run a minimal Flask HTTP server in a daemon thread for Render health checks."""
-    from flask import Flask
+    """Run a minimal HTTP server in a daemon thread so Render detects an active web service."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
 
-    app = Flask(__name__)
+    class KeepAliveHandler(BaseHTTPRequestHandler):
+        """Responds 200 OK on any GET request (/, /health, etc.)."""
 
-    @app.route("/")
-    def index():
-        return "OK", 200
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
 
-    @app.route("/health")
-    def health():
-        return {"status": "healthy", "service": "telegram-unity-bot"}, 200
+        def log_message(self, format: str, *args: Any) -> None:
+            # Suppress default stderr request logs; use structured logger instead
+            logger.debug("HTTP %s", args[0] if args else "")
 
-    # Suppress Flask/Werkzeug request logs to keep bot logs clean
-    werkzeug_log = logging.getLogger("werkzeug")
-    werkzeug_log.setLevel(logging.WARNING)
-
-    app.run(host="0.0.0.0", port=HEALTH_PORT, threaded=True)
+    server = HTTPServer(("0.0.0.0", HEALTH_PORT), KeepAliveHandler)
+    logger.info("Keep-alive HTTP server listening on 0.0.0.0:%d", HEALTH_PORT)
+    server.serve_forever()
 
 
 def main() -> None:
