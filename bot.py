@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ DATA_ROOT = Path(os.environ.get("BOT_DATA_DIR", "/tmp/telegram-unity-bot")).reso
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "25"))
 MAX_VIEW_ITEMS = int(os.environ.get("MAX_VIEW_ITEMS", "200"))
+HEALTH_PORT = int(os.environ.get("PORT", "8080"))
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
 
 logging.basicConfig(
@@ -554,11 +556,41 @@ def build_application() -> Application:
     return application
 
 
+# ---------------------------------------------------------------------------
+# Lightweight Flask health-check server for Render Web Service (free tier)
+# ---------------------------------------------------------------------------
+def start_health_server() -> None:
+    """Run a minimal Flask HTTP server in a daemon thread for Render health checks."""
+    from flask import Flask
+
+    app = Flask(__name__)
+
+    @app.route("/")
+    def index():
+        return "OK", 200
+
+    @app.route("/health")
+    def health():
+        return {"status": "healthy", "service": "telegram-unity-bot"}, 200
+
+    # Suppress Flask/Werkzeug request logs to keep bot logs clean
+    werkzeug_log = logging.getLogger("werkzeug")
+    werkzeug_log.setLevel(logging.WARNING)
+
+    app.run(host="0.0.0.0", port=HEALTH_PORT, threaded=True)
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required; set it as a Render environment variable.")
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     logger.info("Starting bot with data root %s", DATA_ROOT)
+
+    # Start the health-check HTTP server in a background daemon thread
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    logger.info("Health-check server listening on port %s", HEALTH_PORT)
+
     build_application().run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 

@@ -1,11 +1,15 @@
 services:
-  - type: worker
+  - type: web
     name: telegram-unity-bot
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
+    plan: free
+    healthCheckPath: /health
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+      - key: PORT
+        value: "8080"
       - key: BOT_DATA_DIR
         value: /var/data/telegram-unity-bot
