@@ -604,8 +604,12 @@ async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await send_text(update, str(exc))
                 return
 
+    active, _ = active_session(user_id)
+    active_text = f"✅ *Active:* `{active}`" if active else "❌ *No active session*"
+    
     await update.message.reply_text(
-        "📂 *Session Management*\n\n"
+        f"📂 *Session Management*\n\n"
+        f"{active_text}\n\n"
         "Select a session to activate it, or use the buttons below to manage your workspaces.",
         reply_markup=get_session_keyboard(user_id),
         parse_mode="Markdown"
@@ -1038,7 +1042,7 @@ async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await send_text(update, str(exc))
         return
 
-    status_msg = await update.effective_message.reply_text("⏳ Rebuilding Unity bundle... this may take a moment.")
+    status_msg = await update.effective_message.reply_text("⏳ Step 1/2: Rebuilding Unity bundle... (This takes time for large files)")
     try:
         async with repeating_chat_action(context.bot, update.effective_chat.id):
             async with session_lock(user_id, name):
@@ -1051,15 +1055,22 @@ async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         file_size = output_path.stat().st_size
         if file_size <= TELEGRAM_EXPORT_LIMIT:
+            await status_msg.edit_text("⏳ Step 2/2: Sending to Telegram...")
             await update.effective_message.reply_document(
                 document=output_path.open("rb"),
                 filename=output_path.name,
                 caption=f"✅ Modified bundle: '{name}' ({file_size / (1024 * 1024):.1f} MB)."
             )
         else:
-            await send_text(update, f"📦 Bundle is {file_size / (1024 * 1024):.1f} MB. Uploading to external host...")
+            await status_msg.edit_text(f"⏳ Step 2/2: Uploading {file_size / (1024 * 1024):.1f} MB to external host...")
             download_url = await upload_to_external_host(output_path)
-            await send_text(update, f"✅ Export complete! Download link: {download_url}")
+            await update.effective_message.reply_text(
+                f"✅ *Export Complete!*\\n\n"
+                f"📦 *Session:* `{name}`\\n"
+                f"📊 *Size:* `{file_size / (1024 * 1024):.1f} MB`\\n"
+                f"🔗 [Download modified bundle]({download_url})",
+                parse_mode="Markdown"
+            )
         
         try:
             await status_msg.delete()
