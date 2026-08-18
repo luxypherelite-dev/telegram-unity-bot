@@ -165,7 +165,13 @@ def bundle_path(session: Path) -> Path | None:
     if not isinstance(value, str):
         return None
     path = (session / value).resolve()
-    return path if path.parent == session.resolve() and path.is_file() else None
+    # Allow files anywhere within the session directory (including subdirs like input/)
+    session_resolved = session.resolve()
+    try:
+        path.relative_to(session_resolved)
+    except ValueError:
+        return None
+    return path if path.is_file() else None
 
 
 def require_active(user_id: int) -> tuple[str, Path, Path]:
