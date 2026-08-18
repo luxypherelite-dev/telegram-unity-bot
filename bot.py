@@ -28,10 +28,11 @@ import texture2ddecoder  # noqa: F401  # registers supported texture decoders
 from PIL import Image, UnidentifiedImageError
 import traceback
 
-from telegram import BotCommand, Document, Update
+from telegram import BotCommand, Document, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -545,78 +546,135 @@ Upload a Unity .bundle or .assets file after creating or switching to a session.
 
 You can also paste a direct download link (Google Drive, GitHub Releases, Dropbox, Mega, Discord CDN, etc.) to load bundles larger than 20 MB — bypasses Telegram's file size limit!
 
-Session commands:
-/session create <name> — create and select a workspace
-/session switch <name> — select an existing workspace
-/session list — list your workspaces
-/session delete <name> — delete a workspace
+Session management:
+/session — Open the interactive session menu
+/session create <name> — Quick create a session
+/session switch <name> — Quick switch to a session
+/session delete <name> — Quick delete a session
 
 Asset commands:
-/view — list Texture2D names and IDs in the active bundle
-/export — export all readable textures as textures.zip
-/export_raw — dump raw Texture2D streams as raw_assets.zip
-/replace — request a PNG zip, then upload it; filenames must match texture names
-/replace_one <name> — reply to this command with one PNG document
-/clear — remove the active session's uploaded and generated files
+/view — List assets in the active bundle
+/export — Export the modified Unity bundle
+/export_zip — Export textures as PNG zip
+/export_raw — Dump raw asset streams as zip
+/replace — Upload a PNG zip for batch replacement
+/replace_one <name> — Replace one texture (reply to a PNG)
+/clear — Clear session cache
 
-All sessions are isolated by Telegram user ID and session name. Use /help at any time for this guide."""
+All sessions are persistent and isolated by Telegram user ID. Use /help at any time for this guide."""
+
+
+def get_session_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    sessions = list_sessions(user_id)
+    active, _ = active_session(user_id)
+    buttons = []
+    for name in sessions:
+        label = f"✅ {name}" if name == active else name
+        buttons.append([InlineKeyboardButton(label, callback_query_data=f"sess_switch:{name}")])
+    
+    buttons.append([
+        InlineKeyboardButton("➕ Create", callback_query_data="sess_prompt_create"),
+        InlineKeyboardButton("🗑️ Delete", callback_query_data="sess_prompt_delete")
+    ])
+    return InlineKeyboardMarkup(buttons)
 
 
 async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     args = context.args
-    if not args:
-        await send_text(update, "Usage: /session create|switch|list|delete <name>")
-        return
-    action = args[0].casefold()
-    if action == "list":
-        sessions = list_sessions(user_id)
-        active, _ = active_session(user_id)
-        if not sessions:
-            await send_text(update, "You have no sessions. Create one with /session create <name>.")
+    
+    if args:
+        # Support legacy command usage
+        action = args[0].casefold()
+        if action == "list":
+            await update.message.reply_text("Select a session:", reply_markup=get_session_keyboard(user_id))
             return
-        rows = [f"{'*' if name == active else '-'} {name}" for name in sessions]
-        await send_text(update, "Your sessions (asterisk = active):\n" + "\n".join(rows))
-        return
-    if action not in {"create", "switch", "delete"} or len(args) != 2:
-        await send_text(update, "Usage: /session create|switch|delete <name>")
-        return
-    try:
-        name = safe_session_name(args[1])
-    except ValueError as exc:
-        await send_text(update, str(exc))
-        return
+        if len(args) == 2:
+            name = args[1]
+            try:
+                name = safe_session_name(name)
+                if action == "create":
+                    await handle_session_create(update, user_id, name)
+                elif action == "switch":
+                    await handle_session_switch(update, user_id, name)
+                elif action == "delete":
+                    await handle_session_delete(update, user_id, name)
+                return
+            except ValueError as exc:
+                await send_text(update, str(exc))
+                return
+
+    await update.message.reply_text(
+        "📂 *Session Management*\n\n"
+        "Select a session to activate it, or use the buttons below to manage your workspaces.",
+        reply_markup=get_session_keyboard(user_id),
+        parse_mode="Markdown"
+    )
+
+
+async def handle_session_create(update: Update, user_id: int, name: str) -> None:
     sessions = list_sessions(user_id)
+    if name in sessions:
+        await send_text(update, f"Session '{name}' already exists.")
+        return
+    if len(sessions) >= MAX_SESSIONS:
+        await send_text(update, f"Session limit reached ({MAX_SESSIONS}).")
+        return
+    
     target = session_path(user_id, name)
-    if action == "create":
-        if name in sessions:
-            await send_text(update, f"Session '{name}' already exists.")
-            return
-        if len(sessions) >= MAX_SESSIONS:
-            await send_text(update, f"You have reached the session limit ({MAX_SESSIONS}).")
-            return
-        target.mkdir(parents=True, exist_ok=True)
-        create_session(user_id, name)
-        set_active_session(user_id, name)
-        await send_text(update, f"Created and selected session '{name}'. Send a Unity bundle now.")
-    elif action == "switch":
-        if name not in sessions:
-            await send_text(update, f"Session '{name}' does not exist.")
-            return
-        set_active_session(user_id, name)
-        await send_text(update, f"Active session: '{name}'.")
-    else:
-        if name not in sessions:
-            await send_text(update, f"Session '{name}' does not exist.")
-            return
-        shutil.rmtree(target, ignore_errors=True)
-        delete_session(user_id, name)
-        # Check if we deleted the active session
-        active, _ = active_session(user_id)
-        if active == name:
-            set_active_session(user_id, None)
-        SESSION_LOCKS.pop((user_id, name), None)
-        await send_text(update, f"Deleted session '{name}' and its files.")
+    target.mkdir(parents=True, exist_ok=True)
+    create_session(user_id, name)
+    set_active_session(user_id, name)
+    await send_text(update, f"✅ Created and selected session '{name}'. Send a Unity bundle now.")
+
+
+async def handle_session_switch(update: Update, user_id: int, name: str) -> None:
+    sessions = list_sessions(user_id)
+    if name not in sessions:
+        await send_text(update, f"Session '{name}' does not exist.")
+        return
+    set_active_session(user_id, name)
+    await send_text(update, f"✅ Active session: '{name}'.")
+
+
+async def handle_session_delete(update: Update, user_id: int, name: str) -> None:
+    sessions = list_sessions(user_id)
+    if name not in sessions:
+        await send_text(update, f"Session '{name}' does not exist.")
+        return
+    
+    target = session_path(user_id, name)
+    shutil.rmtree(target, ignore_errors=True)
+    delete_session(user_id, name)
+    
+    active, _ = active_session(user_id)
+    if active == name:
+        set_active_session(user_id, None)
+    
+    SESSION_LOCKS.pop((user_id, name), None)
+    await send_text(update, f"🗑️ Deleted session '{name}' and its files.")
+
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = update.effective_user.id
+    data = query.data
+    
+    await query.answer()
+    
+    if data.startswith("sess_switch:"):
+        name = data.split(":", 1)[1]
+        await handle_session_switch(update, user_id, name)
+        try:
+            await query.edit_message_reply_markup(reply_markup=get_session_keyboard(user_id))
+        except Exception:
+            pass
+    
+    elif data == "sess_prompt_create":
+        await query.message.reply_text("➕ To create a session, type: `/session create <name>`", parse_mode="Markdown")
+    
+    elif data == "sess_prompt_delete":
+        await query.message.reply_text("🗑️ To delete a session, type: `/session delete <name>`", parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +920,8 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except RuntimeError as exc:
         await send_text(update, str(exc))
         return
+    
+    status_msg = await update.effective_message.reply_text("⏳ Scanning bundle assets...")
     try:
         async with repeating_chat_action(context.bot, update.effective_chat.id):
             async with session_lock(user_id, name):
@@ -889,9 +949,11 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 filename="textures_list.txt",
                 caption=f"Found {len(entries)} Texture2D asset(s) in '{name}'. Full list attached.",
             )
+        await status_msg.delete()
     except Exception as exc:
         logger.exception("View failed")
         await send_text(update, f"Could not read the bundle: {exc}")
+        await status_msg.delete()
 
 async def export_textures_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await export_assets_zip(update, raw=False)
@@ -908,20 +970,20 @@ async def export_assets_zip(update: Update, raw: bool) -> None:
     except RuntimeError as exc:
         await send_text(update, str(exc))
         return
+    
+    status_msg = await update.effective_message.reply_text("⏳ Preparing assets for export...")
     work = session / "exports"
     work.mkdir(exist_ok=True)
     archive_name = "raw_assets.zip" if raw else "textures.zip"
     archive = work / archive_name
     current_texture = None
     try:
-        async with repeating_chat_action(update.get_bot(), update.effective_chat.id):
+        async with repeating_chat_action(context.bot, update.effective_chat.id):
             async with session_lock(user_id, name):
                 env = load_unity_env(bundle)
                 entries = get_texture_entries(env)
                 total = len(entries)
-                progress = await update.effective_message.reply_text(
-                    f"⏳ Processing {total} textures... this may take a minute."
-                )
+                await status_msg.edit_text(f"⏳ Processing {total} textures... this may take a minute.")
                 count = 0
                 with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
                     for processed, (obj, data) in enumerate(entries, start=1):
@@ -940,29 +1002,32 @@ async def export_assets_zip(update: Update, raw: bool) -> None:
                         count += 1
                         if processed % 50 == 0 or processed == total:
                             try:
-                                await progress.edit_text(
+                                await status_msg.edit_text(
                                     f"⏳ Processing... {processed}/{total} textures done"
                                 )
                             except Exception:
-                                logger.debug("Could not update export progress", exc_info=True)
+                                pass
         if count == 0:
             await send_text(update, "No exportable Texture2D assets were found.")
+            await status_msg.delete()
             return
         archive_size = archive.stat().st_size
         if archive_size > TELEGRAM_EXPORT_LIMIT:
             await send_text(update, f"File is {archive_size / (1024 * 1024):.1f} MB. Uploading to external host...")
             download_url = await upload_to_external_host(archive)
             await send_text(update, f"\u2705 Export complete! Download link: {download_url}")
-            return
-        await update.effective_message.reply_document(
-            document=archive.open("rb"),
-            filename=archive.name,
-            caption=f"Exported {count} asset(s) from '{name}'.",
-        )
+        else:
+            await update.effective_message.reply_document(
+                document=archive.open("rb"),
+                filename=archive.name,
+                caption=f"Exported {count} asset(s) from '{name}'.",
+            )
+        await status_msg.delete()
     except Exception as exc:
         logger.exception("Export failed")
         detail = f" while processing texture '{current_texture}'" if current_texture else ""
         await send_text(update, f"Export failed{detail}: {exc}")
+        await status_msg.delete()
 
 
 async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -973,8 +1038,9 @@ async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await send_text(update, str(exc))
         return
 
+    status_msg = await update.effective_message.reply_text("⏳ Rebuilding Unity bundle... this may take a moment.")
     try:
-        async with repeating_chat_action(update.get_bot(), update.effective_chat.id):
+        async with repeating_chat_action(context.bot, update.effective_chat.id):
             async with session_lock(user_id, name):
                 # Rebuild the bundle
                 env = load_unity_env(bundle)
@@ -995,9 +1061,11 @@ async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await send_text(update, f"Bundle is {file_size / (1024 * 1024):.1f} MB. Uploading to external host...")
             download_url = await upload_to_external_host(output_path)
             await send_text(update, f"\u2705 Export complete! Download link: {download_url}")
+        await status_msg.delete()
     except Exception as exc:
         logger.exception("Bundle export failed")
         await send_text(update, f"Bundle export failed: {exc}")
+        await status_msg.delete()
 
 async def replace_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -1204,6 +1272,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("replace", replace_command))
     application.add_handler(CommandHandler("replace_one", replace_one))
     application.add_handler(CommandHandler("clear", clear_session))
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(MessageHandler(filters.Document.ALL, receive_document))
     # URL handler: detect links in text messages (must come after command handlers)
     application.add_handler(MessageHandler(
