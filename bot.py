@@ -29,6 +29,7 @@ from PIL import Image, UnidentifiedImageError
 import traceback
 
 from telegram import BotCommand, Document, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter, TelegramError
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -1009,6 +1010,8 @@ async def export_assets_zip(update: Update, raw: bool) -> None:
                                 await status_msg.edit_text(
                                     f"⏳ Processing... {processed}/{total} textures done"
                                 )
+                            except RetryAfter as e:
+                                await asyncio.sleep(e.retry_after + 1)
                             except Exception:
                                 pass
         if count == 0:
@@ -1060,16 +1063,20 @@ async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         start_time = datetime.now()
         rebuild_fut = asyncio.create_task(_rebuild_task())
         
-        # Live timer loop
+        # Live timer loop with rate-limit protection
         while not rebuild_fut.done():
             elapsed = int((datetime.now() - start_time).total_seconds())
             mins, secs = divmod(elapsed, 60)
             try:
                 await status_msg.edit_text(f"⏳ Step 1/2: Rebuilding Unity bundle... [{mins:02d}:{secs:02d}]")
+            except RetryAfter as e:
+                # If rate-limited, wait the suggested time plus a bit extra
+                await asyncio.sleep(e.retry_after + 1)
             except Exception:
                 pass
             await asyncio.sleep(5)
         
+        # This will raise any exception that occurred inside the thread
         output_path = await rebuild_fut
         file_size = output_path.stat().st_size
         
