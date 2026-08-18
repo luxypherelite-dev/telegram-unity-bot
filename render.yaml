@@ -6,6 +6,10 @@ services:
     dockerContext: .
     plan: free
     healthCheckPath: /health
+    disk:
+      name: bot-data
+      mountPath: /var/data/telegram-unity-bot
+      sizeGB: 1
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
