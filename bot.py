@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import threading
 import zipfile
@@ -39,10 +40,12 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 DATA_ROOT = Path(os.environ.get("BOT_DATA_DIR", "/tmp/telegram-unity-bot")).resolve()
+DB_PATH = DATA_ROOT / "bot_sessions.db"
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "25"))
 MAX_VIEW_ITEMS = int(os.environ.get("MAX_VIEW_ITEMS", "200"))
 TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+TELEGRAM_EXPORT_LIMIT = 48 * 1024 * 1024  # 48 MB limit for direct send
 HEALTH_PORT = int(os.environ.get("PORT", "10000"))
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
 
@@ -92,6 +95,24 @@ def safe_session_name(name: str) -> str:
     return name
 
 
+def init_db():
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                user_id INTEGER,
+                session_name TEXT,
+                bundle_path TEXT,
+                is_active BOOLEAN,
+                created_at TEXT,
+                metadata TEXT,
+                PRIMARY KEY (user_id, session_name)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_active ON sessions(user_id, is_active)")
+    logger.info("Database initialized at %s", DB_PATH)
+
+
 def user_root(user_id: int) -> Path:
     root = DATA_ROOT / "users" / str(user_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -104,41 +125,42 @@ def session_path(user_id: int, name: str) -> Path:
     return path
 
 
-def state_path(user_id: int) -> Path:
-    return user_root(user_id) / "state.json"
-
-
-def read_state(user_id: int) -> dict[str, Any]:
-    path = state_path(user_id)
-    if not path.exists():
-        return {"active": None}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {"active": None}
-    except (OSError, json.JSONDecodeError):
-        logger.warning("Could not read state for user %s; rebuilding it", user_id)
-        return {"active": None}
-
-
-def write_state(user_id: int, state: dict[str, Any]) -> None:
-    path = state_path(user_id)
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    temp.replace(path)
-
-
 def list_sessions(user_id: int) -> list[str]:
-    directory = user_root(user_id) / "sessions"
-    directory.mkdir(parents=True, exist_ok=True)
-    return sorted(p.name for p in directory.iterdir() if p.is_dir() and SESSION_NAME_RE.fullmatch(p.name))
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("SELECT session_name FROM sessions WHERE user_id = ? ORDER BY session_name", (user_id,))
+        return [row[0] for row in cursor.fetchall()]
 
 
 def active_session(user_id: int) -> tuple[str | None, Path | None]:
-    state = read_state(user_id)
-    active = state.get("active")
-    if not isinstance(active, str) or active not in list_sessions(user_id):
-        return None, None
-    return active, session_path(user_id, active)
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("SELECT session_name FROM sessions WHERE user_id = ? AND is_active = 1", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            return row[0], session_path(user_id, row[0])
+    return None, None
+
+
+def set_active_session(user_id: int, name: str | None) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE sessions SET is_active = 0 WHERE user_id = ?", (user_id,))
+        if name:
+            conn.execute("UPDATE sessions SET is_active = 1 WHERE user_id = ? AND session_name = ?", (user_id, name))
+        conn.commit()
+
+
+def create_session(user_id: int, name: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO sessions (user_id, session_name, is_active, created_at, metadata) VALUES (?, ?, ?, ?, ?)",
+            (user_id, name, 0, now_iso(), json.dumps({"created_at": now_iso(), "bundle": None}))
+        )
+        conn.commit()
+
+
+def delete_session(user_id: int, name: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM sessions WHERE user_id = ? AND session_name = ?", (user_id, name))
+        conn.commit()
 
 
 def session_lock(user_id: int, name: str) -> asyncio.Lock:
@@ -173,23 +195,34 @@ async def repeating_chat_action(
         await asyncio.gather(task, return_exceptions=True)
 
 
-def metadata_path(session: Path) -> Path:
-    return session / "session.json"
 
 
-def load_metadata(session: Path) -> dict[str, Any]:
-    try:
-        return json.loads(metadata_path(session).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+
+def load_metadata(user_id: int, name: str) -> dict[str, Any]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("SELECT metadata FROM sessions WHERE user_id = ? AND session_name = ?", (user_id, name))
+        row = cursor.fetchone()
+        if row and row[0]:
+            try:
+                return json.loads(row[0])
+            except json.JSONDecodeError:
+                pass
+    return {}
 
 
-def save_metadata(session: Path, metadata: dict[str, Any]) -> None:
-    metadata_path(session).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+def save_metadata(user_id: int, name: str, metadata: dict[str, Any]) -> None:
+    metadata_json = json.dumps(metadata)
+    bundle_path_str = metadata.get("bundle")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE sessions SET metadata = ?, bundle_path = ? WHERE user_id = ? AND session_name = ?",
+            (metadata_json, bundle_path_str, user_id, name)
+        )
+        conn.commit()
 
 
-def bundle_path(session: Path) -> Path | None:
-    value = load_metadata(session).get("bundle")
+def bundle_path(user_id: int, name: str, session: Path) -> Path | None:
+    value = load_metadata(user_id, name).get("bundle")
     if not isinstance(value, str):
         return None
     path = (session / value).resolve()
@@ -206,7 +239,7 @@ def require_active(user_id: int) -> tuple[str, Path, Path]:
     name, session = active_session(user_id)
     if not name or not session:
         raise RuntimeError("No active session. Create or switch one with /session create <name>.")
-    bundle = bundle_path(session)
+    bundle = bundle_path(user_id, name, session)
     if not bundle:
         raise RuntimeError("The active session has no uploaded bundle. Send a .bundle or .assets file first.")
     return name, session, bundle
@@ -554,7 +587,7 @@ async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await send_text(update, str(exc))
         return
     sessions = list_sessions(user_id)
-    target = user_root(user_id) / "sessions" / name
+    target = session_path(user_id, name)
     if action == "create":
         if name in sessions:
             await send_text(update, f"Session '{name}' already exists.")
@@ -562,29 +595,26 @@ async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if len(sessions) >= MAX_SESSIONS:
             await send_text(update, f"You have reached the session limit ({MAX_SESSIONS}).")
             return
-        target.mkdir(parents=True, exist_ok=False)
-        save_metadata(target, {"created_at": now_iso(), "bundle": None})
-        state = read_state(user_id)
-        state["active"] = name
-        write_state(user_id, state)
+        target.mkdir(parents=True, exist_ok=True)
+        create_session(user_id, name)
+        set_active_session(user_id, name)
         await send_text(update, f"Created and selected session '{name}'. Send a Unity bundle now.")
     elif action == "switch":
         if name not in sessions:
             await send_text(update, f"Session '{name}' does not exist.")
             return
-        state = read_state(user_id)
-        state["active"] = name
-        write_state(user_id, state)
+        set_active_session(user_id, name)
         await send_text(update, f"Active session: '{name}'.")
     else:
         if name not in sessions:
             await send_text(update, f"Session '{name}' does not exist.")
             return
-        shutil.rmtree(target)
-        state = read_state(user_id)
-        if state.get("active") == name:
-            state["active"] = None
-        write_state(user_id, state)
+        shutil.rmtree(target, ignore_errors=True)
+        delete_session(user_id, name)
+        # Check if we deleted the active session
+        active, _ = active_session(user_id)
+        if active == name:
+            set_active_session(user_id, None)
         SESSION_LOCKS.pop((user_id, name), None)
         await send_text(update, f"Deleted session '{name}' and its files.")
 
@@ -664,6 +694,18 @@ async def download_from_url(url: str, destination: Path) -> int:
     return total_bytes
 
 
+async def upload_to_external_host(file_path: Path) -> str:
+    """Upload a file to Catbox and return the direct download link."""
+    url = "https://catbox.moe/user/api.php"
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        with open(file_path, "rb") as f:
+            files = {"fileToUpload": (file_path.name, f)}
+            data = {"reqtype": "fileupload"}
+            response = await client.post(url, data=data, files=files)
+            response.raise_for_status()
+            return response.text.strip()
+
+
 async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text messages containing URLs to bundle files."""
     message = update.effective_message
@@ -712,7 +754,7 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await send_text(update, f"\u2705 Downloaded {size_mb:.1f} MB. Processing as replacement archive...")
             # Simulate the replacement flow
             async with session_lock(user.id, name):
-                bundle = bundle_path(session)
+                bundle = bundle_path(user.id, name, session)
                 if not bundle:
                     await send_text(update, "No bundle loaded in this session to replace textures in.")
                     return
@@ -751,8 +793,8 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await send_text(update, report)
         else:
             # Treat as a bundle upload
-            save_metadata(session, {
-                **load_metadata(session),
+            save_metadata(user.id, name, {
+                **load_metadata(user.id, name),
                 "bundle": destination.relative_to(session).as_posix(),
                 "uploaded_at": now_iso(),
                 "source_url": url[:500],
@@ -798,7 +840,7 @@ async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     async with repeating_chat_action(context.bot, message.chat_id):
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(custom_path=destination)
-    save_metadata(session, {**load_metadata(session), "bundle": destination.relative_to(session).as_posix(), "uploaded_at": now_iso()})
+    save_metadata(user.id, name, {**load_metadata(user.id, name), "bundle": destination.relative_to(session).as_posix(), "uploaded_at": now_iso()})
     context.user_data.pop("pending_upload", None)
     await send_text(update, f"Loaded '{filename}' into session '{name}'. Use /view, /export, or /replace.")
 
@@ -851,15 +893,15 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.exception("View failed")
         await send_text(update, f"Could not read the bundle: {exc}")
 
-async def export_textures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await export_assets(update, raw=False)
+async def export_textures_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await export_assets_zip(update, raw=False)
 
 
-async def export_raw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await export_assets(update, raw=True)
+async def export_raw_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await export_assets_zip(update, raw=True)
 
 
-async def export_assets(update: Update, raw: bool) -> None:
+async def export_assets_zip(update: Update, raw: bool) -> None:
     user_id = update.effective_user.id
     try:
         name, session, bundle = require_active(user_id)
@@ -907,17 +949,10 @@ async def export_assets(update: Update, raw: bool) -> None:
             await send_text(update, "No exportable Texture2D assets were found.")
             return
         archive_size = archive.stat().st_size
-        if archive_size > TELEGRAM_MAX_UPLOAD_BYTES:
-            suggestion = (
-                "Try /export_raw instead or split the bundle into smaller parts."
-                if not raw
-                else "Please split the bundle into smaller parts."
-            )
-            await send_text(
-                update,
-                f"The generated file is too large for Telegram ({archive_size / (1024 * 1024):.1f} MiB; "
-                f"Telegram's limit is 50 MiB). {suggestion}",
-            )
+        if archive_size > TELEGRAM_EXPORT_LIMIT:
+            await send_text(update, f"File is {archive_size / (1024 * 1024):.1f} MB. Uploading to external host...")
+            download_url = await upload_to_external_host(archive)
+            await send_text(update, f"\u2705 Export complete! Download link: {download_url}")
             return
         await update.effective_message.reply_document(
             document=archive.open("rb"),
@@ -928,6 +963,41 @@ async def export_assets(update: Update, raw: bool) -> None:
         logger.exception("Export failed")
         detail = f" while processing texture '{current_texture}'" if current_texture else ""
         await send_text(update, f"Export failed{detail}: {exc}")
+
+
+async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    try:
+        name, session, bundle = require_active(user_id)
+    except RuntimeError as exc:
+        await send_text(update, str(exc))
+        return
+
+    try:
+        async with repeating_chat_action(update.get_bot(), update.effective_chat.id):
+            async with session_lock(user_id, name):
+                # Rebuild the bundle
+                env = load_unity_env(bundle)
+                # The bundle is already modified in memory if /replace was called.
+                # We save it to a new file in exports.
+                output_path = session / "exports" / f"modified_{bundle.name}"
+                output_path.parent.mkdir(exist_ok=True)
+                output_path.write_bytes(env.file.save())
+
+        file_size = output_path.stat().st_size
+        if file_size <= TELEGRAM_EXPORT_LIMIT:
+            await update.effective_message.reply_document(
+                document=output_path.open("rb"),
+                filename=output_path.name,
+                caption=f"Modified bundle from session '{name}' ({file_size / (1024 * 1024):.1f} MB)."
+            )
+        else:
+            await send_text(update, f"Bundle is {file_size / (1024 * 1024):.1f} MB. Uploading to external host...")
+            download_url = await upload_to_external_host(output_path)
+            await send_text(update, f"\u2705 Export complete! Download link: {download_url}")
+    except Exception as exc:
+        logger.exception("Bundle export failed")
+        await send_text(update, f"Bundle export failed: {exc}")
 
 async def replace_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -1048,12 +1118,11 @@ async def clear_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     async with session_lock(user_id, name):
         for child in session.iterdir():
-            if child.name != "session.json":
-                if child.is_dir():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink(missing_ok=True)
-        save_metadata(session, {**load_metadata(session), "bundle": None, "cleared_at": now_iso()})
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+        save_metadata(user_id, name, {**load_metadata(user_id, name), "bundle": None, "cleared_at": now_iso()})
     context.user_data.pop("pending_upload", None)
     await send_text(update, f"Cleared cached files in active session '{name}'.")
 
@@ -1103,7 +1172,8 @@ BOT_COMMANDS = [
     BotCommand("help", "Display all available commands"),
     BotCommand("session", "Manage sessions: create, switch, list, delete"),
     BotCommand("view", "List Texture2D assets in the active bundle"),
-    BotCommand("export", "Export all textures as PNG zip"),
+    BotCommand("export", "Export the modified Unity bundle"),
+    BotCommand("export_zip", "Export all textures as PNG zip"),
     BotCommand("export_raw", "Dump raw binary asset streams as zip"),
     BotCommand("replace", "Batch-replace textures from a PNG zip"),
     BotCommand("replace_one", "Replace a single texture (reply to PNG)"),
@@ -1128,8 +1198,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler(["start", "help"], start))
     application.add_handler(CommandHandler("session", session_command))
     application.add_handler(CommandHandler("view", view_assets))
-    application.add_handler(CommandHandler("export", export_textures))
-    application.add_handler(CommandHandler("export_raw", export_raw))
+    application.add_handler(CommandHandler("export", export_bundle))
+    application.add_handler(CommandHandler("export_zip", export_textures_zip))
+    application.add_handler(CommandHandler("export_raw", export_raw_zip))
     application.add_handler(CommandHandler("replace", replace_command))
     application.add_handler(CommandHandler("replace_one", replace_one))
     application.add_handler(CommandHandler("clear", clear_session))
@@ -1172,7 +1243,7 @@ def start_health_server() -> None:
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required; set it as a Render environment variable.")
-    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    init_db()
     logger.info("Starting bot with data root %s", DATA_ROOT)
 
     # Start the health-check HTTP server in a background daemon thread

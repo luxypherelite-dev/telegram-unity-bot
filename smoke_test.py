@@ -17,9 +17,11 @@ with tempfile.TemporaryDirectory() as tmp:
 
     assert list(bot.archive_candidates("Skin_123.png")) == ["skin_123", "skin"]
     assert bot.safe_filename("../../secret.png") == "secret.png"
+    bot.init_db()
     bot.session_path(7, "UI_Mod")
+    bot.create_session(7, "UI_Mod")
     assert bot.list_sessions(7) == ["UI_Mod"]
-    bot.write_state(7, {"active": "UI_Mod"})
+    bot.set_active_session(7, "UI_Mod")
     assert bot.active_session(7)[0] == "UI_Mod"
     application = bot.build_application()
     assert application is not None

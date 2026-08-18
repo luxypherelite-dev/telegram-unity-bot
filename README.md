@@ -11,10 +11,11 @@ The bot token must be supplied through the `TELEGRAM_BOT_TOKEN` environment vari
 | Area | Behavior |
 | --- | --- |
 | Sessions | Each Telegram user has isolated named sessions. The active session receives all bundle and asset commands. |
-| Viewing | `/view` lists readable Texture2D names, path IDs, dimensions, and formats. |
-| PNG export | `/export` creates and sends `textures.zip`. |
+| Viewing | `/view` lists readable Texture2D names, path IDs, dimensions, and formats. Outputs to `.txt` if list is large. |
+| Bundle export | `/export` rebuilds and sends the modified Unity bundle. Bypasses 50MB limit via external hosting (Catbox). |
+| PNG export | `/export_zip` creates and sends `textures.zip`. |
 | Raw export | `/export_raw` creates and sends `raw_assets.zip` containing uncompressed asset streams where UnityPy exposes them. |
-| Batch replacement | `/replace` arms the bot for a ZIP of PNGs. Each filename should match a texture name, optionally with `_pathid`. |
+| Batch replacement | `/replace` arms the bot for a ZIP of PNGs. Re-encodes payloads directly in memory. Filenames should match texture name or `_pathid`. |
 | Single replacement | Reply to a PNG document with `/replace_one <name>`. The name can be an exact Texture2D name or path ID. |
 | Cleanup | `/clear` removes the active session’s bundle, input files, and generated exports. |
 
@@ -22,7 +23,7 @@ The implementation uses `UnityPy.load(...)` to read bundles, filters objects who
 
 ## Commands
 
-Use `/start` or `/help` to display the command guide. Session commands are `/session create <name>`, `/session switch <name>`, `/session list`, and `/session delete <name>`. Asset commands are `/view`, `/export`, `/export_raw`, `/replace`, `/replace_one <name>`, and `/clear`.
+Use `/start` or `/help` to display the command guide. Session commands are `/session create <name>`, `/session switch <name>`, `/session list`, and `/session delete <name>`. Asset commands are `/view`, `/export`, `/export_zip`, `/export_raw`, `/replace`, `/replace_one <name>`, and `/clear`.
 
 To upload a bundle, first create or switch to a session, then send a `.bundle`, `.assets`, `.unity3d`, `.resS`, or `.resource` document. The upload is stored in the active session. The bot does not execute uploaded files; it only parses them with UnityPy and Pillow.
 
@@ -64,6 +65,6 @@ docker run --rm \
 
 Only `Texture2D` assets are supported. A texture may be listed but not exportable if the installed UnityPy decoder cannot decode its format. Batch replacement deliberately reads ZIP members in memory and does not extract arbitrary paths, which prevents ZIP path traversal. Session names and uploaded filenames are sanitized, and all session file paths are constrained beneath the user’s own workspace.
 
-The bot uses in-memory asyncio locks to serialize operations within a running process. Because Render runs one worker instance for this deployment pattern, the design keeps session metadata on disk but does not implement distributed locking or a database. If the service is later scaled horizontally, move session metadata and binary workspaces to shared object storage and add a shared lock or job queue.
+The bot uses in-memory asyncio locks to serialize operations within a running process. Session metadata and active session states are managed via a SQLite database (`bot_sessions.db`), ensuring persistence and automatic session recovery across bot restarts. If the service is later scaled horizontally, move session metadata and binary workspaces to shared object storage and add a shared lock or job queue.
 
 [^1]: [NOT UABE reference repository](https://github.com/jackolegamer1/not-uabe), including its [README](https://raw.githubusercontent.com/jackolegamer1/not-uabe/main/README.md) and [UnityPy implementation](https://raw.githubusercontent.com/jackolegamer1/not-uabe/main/uabe.py).
