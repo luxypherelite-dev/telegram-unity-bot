@@ -961,14 +961,14 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await status_msg.delete()
 
 async def export_textures_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await export_assets_zip(update, raw=False)
+    await export_assets_zip(update, context, raw=False)
 
 
 async def export_raw_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await export_assets_zip(update, raw=True)
+    await export_assets_zip(update, context, raw=True)
 
 
-async def export_assets_zip(update: Update, raw: bool) -> None:
+async def export_assets_zip(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: bool) -> None:
     user_id = update.effective_user.id
     try:
         name, session, bundle = require_active(user_id)
