@@ -793,6 +793,7 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_text(update, str(exc))
         return
     try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         async with session_lock(user_id, name):
             env = load_unity_env(bundle)
             entries = get_texture_entries(env)
@@ -847,6 +848,7 @@ async def export_assets(update: Update, raw: bool) -> None:
     archive_name = "raw_assets.zip" if raw else "textures.zip"
     archive = work / archive_name
     try:
+        await update.effective_message.reply_chat_action(action=ChatAction.UPLOAD_DOCUMENT)
         async with session_lock(user_id, name):
             env = load_unity_env(bundle)
             entries = get_texture_entries(env)
@@ -905,6 +907,7 @@ async def process_replace_archive(update: Update, context: ContextTypes.DEFAULT_
     archive_path = session / "input" / "replacement.zip"
     archive_path.parent.mkdir(exist_ok=True)
     try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(custom_path=archive_path)
         async with session_lock(user_id, name):
@@ -965,6 +968,7 @@ async def replace_one(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_text(update, str(exc))
         return
     try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         async with session_lock(user_id, name):
             env = load_unity_env(bundle)
             target = find_texture(env, requested)
