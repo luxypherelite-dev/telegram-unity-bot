@@ -570,11 +570,11 @@ def get_session_keyboard(user_id: int) -> InlineKeyboardMarkup:
     buttons = []
     for name in sessions:
         label = f"✅ {name}" if name == active else name
-        buttons.append([InlineKeyboardButton(label, callback_query_data=f"sess_switch:{name}")])
+        buttons.append([InlineKeyboardButton(label, callback_data=f"sess_switch:{name}")])
     
     buttons.append([
-        InlineKeyboardButton("➕ Create", callback_query_data="sess_prompt_create"),
-        InlineKeyboardButton("🗑️ Delete", callback_query_data="sess_prompt_delete")
+        InlineKeyboardButton("➕ Create", callback_data="sess_prompt_create"),
+        InlineKeyboardButton("🗑️ Delete", callback_data="sess_prompt_delete")
     ])
     return InlineKeyboardMarkup(buttons)
 
