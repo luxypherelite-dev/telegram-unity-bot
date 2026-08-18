@@ -780,10 +780,15 @@ async def receive_photo_or_document(update: Update, context: ContextTypes.DEFAUL
         await receive_document(update, context)
 
 
+# Maximum characters for inline text message (Telegram limit is 4096; leave margin)
+TELEGRAM_MSG_LIMIT = 4000
+VIEW_INLINE_MAX_ITEMS = 50
+
+
 async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     try:
-        name, _, bundle = require_active(user_id)
+        name, session, bundle = require_active(user_id)
     except RuntimeError as exc:
         await send_text(update, str(exc))
         return
@@ -792,7 +797,7 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             env = load_unity_env(bundle)
             entries = get_texture_entries(env)
             lines = []
-            for obj, data in entries[:MAX_VIEW_ITEMS]:
+            for obj, data in entries:
                 width = getattr(data, "m_Width", "?")
                 height = getattr(data, "m_Height", "?")
                 fmt = str(getattr(data, "m_TextureFormat", "?"))
@@ -800,8 +805,23 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not lines:
             await send_text(update, f"No readable Texture2D assets found in session '{name}'.")
             return
-        suffix = f"\nShowing first {MAX_VIEW_ITEMS}." if len(entries) > MAX_VIEW_ITEMS else ""
-        await send_text(update, f"Texture2D assets in '{name}' ({len(entries)} total):\n" + "\n".join(lines) + suffix)
+
+        header = f"Texture2D assets in '{name}' ({len(entries)} total):"
+        full_text = header + "\n" + "\n".join(lines)
+
+        # If the list is short enough, send as inline text
+        if len(lines) <= VIEW_INLINE_MAX_ITEMS and len(full_text) <= TELEGRAM_MSG_LIMIT:
+            await send_text(update, full_text)
+        else:
+            # Send as a .txt document to avoid Telegram's 4096 char limit
+            txt_path = session / "exports" / "textures_list.txt"
+            txt_path.parent.mkdir(parents=True, exist_ok=True)
+            txt_path.write_text(full_text, encoding="utf-8")
+            await update.effective_message.reply_document(
+                document=txt_path.open("rb"),
+                filename="textures_list.txt",
+                caption=f"Found {len(entries)} Texture2D asset(s) in '{name}'. Full list attached.",
+            )
     except Exception as exc:
         logger.exception("View failed")
         await send_text(update, f"Could not read the bundle: {exc}")
