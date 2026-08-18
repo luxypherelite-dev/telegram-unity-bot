@@ -7,6 +7,7 @@ Telegram token to source control. Persistent storage is controlled by BOT_DATA_D
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import io
 import json
 import logging
@@ -41,6 +42,7 @@ DATA_ROOT = Path(os.environ.get("BOT_DATA_DIR", "/tmp/telegram-unity-bot")).reso
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "25"))
 MAX_VIEW_ITEMS = int(os.environ.get("MAX_VIEW_ITEMS", "200"))
+TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 HEALTH_PORT = int(os.environ.get("PORT", "10000"))
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
 
@@ -143,6 +145,32 @@ def session_lock(user_id: int, name: str) -> asyncio.Lock:
     key = (user_id, name)
     SESSION_LOCKS.setdefault(key, asyncio.Lock())
     return SESSION_LOCKS[key]
+
+
+@asynccontextmanager
+async def repeating_chat_action(
+    bot: Any,
+    chat_id: int,
+    action: str = ChatAction.UPLOAD_DOCUMENT,
+):
+    """Keep a Telegram chat action alive until a long operation completes."""
+
+    async def _send_repeatedly() -> None:
+        try:
+            while True:
+                await bot.send_chat_action(chat_id=chat_id, action=action)
+                await asyncio.sleep(4)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Failed to send repeated chat action", exc_info=True)
+
+    task = asyncio.create_task(_send_repeatedly())
+    try:
+        yield
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def metadata_path(session: Path) -> Path:
@@ -668,11 +696,11 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         filename = filename + ".bundle"
 
     await send_text(update, f"\u2b07\ufe0f Downloading from URL...\nFile: {filename}")
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
     destination = session / "input" / filename
     try:
-        total = await download_from_url(url, destination)
+        async with repeating_chat_action(context.bot, message.chat_id):
+            total = await download_from_url(url, destination)
         size_mb = total / (1024 * 1024)
         logger.info(
             "Downloaded %.1f MB from URL for user %s session '%s': %s",
@@ -767,9 +795,9 @@ async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     destination = session / "input" / filename
     destination.parent.mkdir(exist_ok=True)
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-    telegram_file = await document.get_file()
-    await telegram_file.download_to_drive(custom_path=destination)
+    async with repeating_chat_action(context.bot, message.chat_id):
+        telegram_file = await document.get_file()
+        await telegram_file.download_to_drive(custom_path=destination)
     save_metadata(session, {**load_metadata(session), "bundle": destination.relative_to(session).as_posix(), "uploaded_at": now_iso()})
     context.user_data.pop("pending_upload", None)
     await send_text(update, f"Loaded '{filename}' into session '{name}'. Use /view, /export, or /replace.")
@@ -793,28 +821,24 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_text(update, str(exc))
         return
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        async with session_lock(user_id, name):
-            env = load_unity_env(bundle)
-            entries = get_texture_entries(env)
-            lines = []
-            for obj, data in entries:
-                width = getattr(data, "m_Width", "?")
-                height = getattr(data, "m_Height", "?")
-                fmt = str(getattr(data, "m_TextureFormat", "?"))
-                lines.append(f"{texture_name(obj, data)} | id={obj.path_id} | {width}x{height} | {fmt}")
+        async with repeating_chat_action(context.bot, update.effective_chat.id):
+            async with session_lock(user_id, name):
+                env = load_unity_env(bundle)
+                entries = get_texture_entries(env)
+                lines = []
+                for obj, data in entries:
+                    width = getattr(data, "m_Width", "?")
+                    height = getattr(data, "m_Height", "?")
+                    fmt = str(getattr(data, "m_TextureFormat", "?"))
+                    lines.append(f"{texture_name(obj, data)} | id={obj.path_id} | {width}x{height} | {fmt}")
         if not lines:
             await send_text(update, f"No readable Texture2D assets found in session '{name}'.")
             return
-
         header = f"Texture2D assets in '{name}' ({len(entries)} total):"
         full_text = header + "\n" + "\n".join(lines)
-
-        # If the list is short enough, send as inline text
         if len(lines) <= VIEW_INLINE_MAX_ITEMS and len(full_text) <= TELEGRAM_MSG_LIMIT:
             await send_text(update, full_text)
         else:
-            # Send as a .txt document to avoid Telegram's 4096 char limit
             txt_path = session / "exports" / "textures_list.txt"
             txt_path.parent.mkdir(parents=True, exist_ok=True)
             txt_path.write_text(full_text, encoding="utf-8")
@@ -826,7 +850,6 @@ async def view_assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as exc:
         logger.exception("View failed")
         await send_text(update, f"Could not read the bundle: {exc}")
-
 
 async def export_textures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await export_assets(update, raw=False)
@@ -847,34 +870,64 @@ async def export_assets(update: Update, raw: bool) -> None:
     work.mkdir(exist_ok=True)
     archive_name = "raw_assets.zip" if raw else "textures.zip"
     archive = work / archive_name
+    current_texture = None
     try:
-        await update.effective_message.reply_chat_action(action=ChatAction.UPLOAD_DOCUMENT)
-        async with session_lock(user_id, name):
-            env = load_unity_env(bundle)
-            entries = get_texture_entries(env)
-            count = 0
-            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-                for obj, data in entries:
-                    asset_name = safe_filename(texture_name(obj, data), f"Asset_{obj.path_id}")
-                    if raw:
-                        payload = raw_asset_bytes(obj, data)
-                        zf.writestr(f"{asset_name}_{obj.path_id}.bin", payload)
-                    else:
-                        image = decode_image(data)
-                        if image is None:
-                            continue
-                        buf = io.BytesIO()
-                        image.save(buf, format="PNG")
-                        zf.writestr(f"{asset_name}_{obj.path_id}.png", buf.getvalue())
-                    count += 1
+        async with repeating_chat_action(update.get_bot(), update.effective_chat.id):
+            async with session_lock(user_id, name):
+                env = load_unity_env(bundle)
+                entries = get_texture_entries(env)
+                total = len(entries)
+                progress = await update.effective_message.reply_text(
+                    f"⏳ Processing {total} textures... this may take a minute."
+                )
+                count = 0
+                with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for processed, (obj, data) in enumerate(entries, start=1):
+                        current_texture = texture_name(obj, data)
+                        asset_name = safe_filename(current_texture, f"Asset_{obj.path_id}")
+                        if raw:
+                            payload = raw_asset_bytes(obj, data)
+                            zf.writestr(f"{asset_name}_{obj.path_id}.bin", payload)
+                        else:
+                            image = decode_image(data)
+                            if image is None:
+                                continue
+                            buf = io.BytesIO()
+                            image.save(buf, format="PNG")
+                            zf.writestr(f"{asset_name}_{obj.path_id}.png", buf.getvalue())
+                        count += 1
+                        if processed % 50 == 0 or processed == total:
+                            try:
+                                await progress.edit_text(
+                                    f"⏳ Processing... {processed}/{total} textures done"
+                                )
+                            except Exception:
+                                logger.debug("Could not update export progress", exc_info=True)
         if count == 0:
             await send_text(update, "No exportable Texture2D assets were found.")
             return
-        await update.effective_message.reply_document(document=archive.open("rb"), filename=archive.name, caption=f"Exported {count} asset(s) from '{name}'.")
+        archive_size = archive.stat().st_size
+        if archive_size > TELEGRAM_MAX_UPLOAD_BYTES:
+            suggestion = (
+                "Try /export_raw instead or split the bundle into smaller parts."
+                if not raw
+                else "Please split the bundle into smaller parts."
+            )
+            await send_text(
+                update,
+                f"The generated file is too large for Telegram ({archive_size / (1024 * 1024):.1f} MiB; "
+                f"Telegram's limit is 50 MiB). {suggestion}",
+            )
+            return
+        await update.effective_message.reply_document(
+            document=archive.open("rb"),
+            filename=archive.name,
+            caption=f"Exported {count} asset(s) from '{name}'.",
+        )
     except Exception as exc:
         logger.exception("Export failed")
-        await send_text(update, f"Export failed: {exc}")
-
+        detail = f" while processing texture '{current_texture}'" if current_texture else ""
+        await send_text(update, f"Export failed{detail}: {exc}")
 
 async def replace_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -907,38 +960,38 @@ async def process_replace_archive(update: Update, context: ContextTypes.DEFAULT_
     archive_path = session / "input" / "replacement.zip"
     archive_path.parent.mkdir(exist_ok=True)
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        telegram_file = await document.get_file()
-        await telegram_file.download_to_drive(custom_path=archive_path)
-        async with session_lock(user_id, name):
-            env = load_unity_env(bundle)
-            textures = get_texture_entries(env)
-            by_name = {texture_name(obj, data).casefold(): (obj, data) for obj, data in textures}
-            by_id = {str(obj.path_id): (obj, data) for obj, data in textures}
-            replaced: list[str] = []
-            skipped: list[str] = []
-            with zipfile.ZipFile(archive_path) as zf:
-                for info in zf.infolist():
-                    if info.is_dir() or not info.filename.casefold().endswith(".png"):
-                        continue
-                    target = None
-                    for candidate in archive_candidates(Path(info.filename).name):
-                        target = by_name.get(candidate) or by_id.get(candidate)
-                        if target:
-                            break
-                    if not target:
-                        skipped.append(Path(info.filename).name)
-                        continue
-                    try:
-                        image = Image.open(io.BytesIO(zf.read(info))).convert("RGBA")
-                        target[1].image = image
-                        target[1].save()
-                        replaced.append(texture_name(*target))
-                    except (UnidentifiedImageError, OSError, ValueError) as exc:
-                        logger.warning("Skipping replacement %s: %s", info.filename, exc)
-                        skipped.append(Path(info.filename).name)
-            if replaced:
-                bundle.write_bytes(env.file.save())
+        async with repeating_chat_action(context.bot, update.effective_chat.id):
+            telegram_file = await document.get_file()
+            await telegram_file.download_to_drive(custom_path=archive_path)
+            async with session_lock(user_id, name):
+                env = load_unity_env(bundle)
+                textures = get_texture_entries(env)
+                by_name = {texture_name(obj, data).casefold(): (obj, data) for obj, data in textures}
+                by_id = {str(obj.path_id): (obj, data) for obj, data in textures}
+                replaced: list[str] = []
+                skipped: list[str] = []
+                with zipfile.ZipFile(archive_path) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir() or not info.filename.casefold().endswith(".png"):
+                            continue
+                        target = None
+                        for candidate in archive_candidates(Path(info.filename).name):
+                            target = by_name.get(candidate) or by_id.get(candidate)
+                            if target:
+                                break
+                        if not target:
+                            skipped.append(Path(info.filename).name)
+                            continue
+                        try:
+                            image = Image.open(io.BytesIO(zf.read(info))).convert("RGBA")
+                            target[1].image = image
+                            target[1].save()
+                            replaced.append(texture_name(*target))
+                        except (UnidentifiedImageError, OSError, ValueError) as exc:
+                            logger.warning("Skipping replacement %s: %s", info.filename, exc)
+                            skipped.append(Path(info.filename).name)
+                if replaced:
+                    bundle.write_bytes(env.file.save())
         context.user_data.pop("pending_upload", None)
         report = f"Replaced {len(replaced)} texture(s) in '{name}'."
         if skipped:
@@ -946,7 +999,6 @@ async def process_replace_archive(update: Update, context: ContextTypes.DEFAULT_
         await send_text(update, report)
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
         await send_text(update, f"Batch replacement failed: {exc}")
-
 
 async def replace_one(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -968,25 +1020,24 @@ async def replace_one(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_text(update, str(exc))
         return
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        async with session_lock(user_id, name):
-            env = load_unity_env(bundle)
-            target = find_texture(env, requested)
-            if not target:
-                await send_text(update, f"Texture '{requested}' was not found. Use /view for exact names.")
-                return
-            temp = session / "input" / "single_replacement.png"
-            temp.parent.mkdir(exist_ok=True)
-            tg_file = await document.get_file()
-            await tg_file.download_to_drive(custom_path=temp)
-            image = Image.open(temp).convert("RGBA")
-            target[1].image = image
-            target[1].save()
-            bundle.write_bytes(env.file.save())
+        async with repeating_chat_action(context.bot, update.effective_chat.id):
+            async with session_lock(user_id, name):
+                env = load_unity_env(bundle)
+                target = find_texture(env, requested)
+                if not target:
+                    await send_text(update, f"Texture '{requested}' was not found. Use /view for exact names.")
+                    return
+                temp = session / "input" / "single_replacement.png"
+                temp.parent.mkdir(exist_ok=True)
+                tg_file = await document.get_file()
+                await tg_file.download_to_drive(custom_path=temp)
+                image = Image.open(temp).convert("RGBA")
+                target[1].image = image
+                target[1].save()
+                bundle.write_bytes(env.file.save())
         await send_text(update, f"Replaced '{texture_name(*target)}' in session '{name}'.")
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         await send_text(update, f"Single replacement failed: {exc}")
-
 
 async def clear_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
