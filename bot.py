@@ -1042,18 +1042,37 @@ async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await send_text(update, str(exc))
         return
 
-    status_msg = await update.effective_message.reply_text("⏳ Step 1/2: Rebuilding Unity bundle... (This takes time for large files)")
-    try:
-        async with repeating_chat_action(context.bot, update.effective_chat.id):
-            async with session_lock(user_id, name):
-                # Rebuild the bundle
+    status_msg = await update.effective_message.reply_text("⏳ Step 1/2: Rebuilding Unity bundle... [00:00]")
+    
+    async def _rebuild_task():
+        async with session_lock(user_id, name):
+            # Run the blocking save operation in a thread to keep the event loop free
+            def _save():
                 env = load_unity_env(bundle)
                 output_path = session / "exports" / f"modified_{bundle.name}"
                 output_path.parent.mkdir(exist_ok=True)
-                # Use env.file.save() to get modified bytes
                 output_path.write_bytes(env.file.save())
+                return output_path
+            
+            return await asyncio.to_thread(_save)
 
+    try:
+        start_time = datetime.now()
+        rebuild_fut = asyncio.create_task(_rebuild_task())
+        
+        # Live timer loop
+        while not rebuild_fut.done():
+            elapsed = int((datetime.now() - start_time).total_seconds())
+            mins, secs = divmod(elapsed, 60)
+            try:
+                await status_msg.edit_text(f"⏳ Step 1/2: Rebuilding Unity bundle... [{mins:02d}:{secs:02d}]")
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+        
+        output_path = await rebuild_fut
         file_size = output_path.stat().st_size
+        
         if file_size <= TELEGRAM_EXPORT_LIMIT:
             await status_msg.edit_text("⏳ Step 2/2: Sending to Telegram...")
             await update.effective_message.reply_document(
@@ -1062,7 +1081,7 @@ async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 caption=f"✅ Modified bundle: '{name}' ({file_size / (1024 * 1024):.1f} MB)."
             )
         else:
-            await status_msg.edit_text(f"⏳ Step 2/2: Uploading {file_size / (1024 * 1024):.1f} MB to external host...")
+            await status_msg.edit_text(f"⏳ Step 2/2: Uploading {file_size / (1024 * 1024):.1f} MB to host...")
             download_url = await upload_to_external_host(output_path)
             await update.effective_message.reply_text(
                 f"✅ *Export Complete!*\\n\n"
