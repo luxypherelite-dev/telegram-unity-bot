@@ -1044,10 +1044,9 @@ async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             async with session_lock(user_id, name):
                 # Rebuild the bundle
                 env = load_unity_env(bundle)
-                # The bundle is already modified in memory if /replace was called.
-                # We save it to a new file in exports.
                 output_path = session / "exports" / f"modified_{bundle.name}"
                 output_path.parent.mkdir(exist_ok=True)
+                # Use env.file.save() to get modified bytes
                 output_path.write_bytes(env.file.save())
 
         file_size = output_path.stat().st_size
@@ -1055,17 +1054,47 @@ async def export_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await update.effective_message.reply_document(
                 document=output_path.open("rb"),
                 filename=output_path.name,
-                caption=f"Modified bundle from session '{name}' ({file_size / (1024 * 1024):.1f} MB)."
+                caption=f"✅ Modified bundle: '{name}' ({file_size / (1024 * 1024):.1f} MB)."
             )
         else:
-            await send_text(update, f"Bundle is {file_size / (1024 * 1024):.1f} MB. Uploading to external host...")
+            await send_text(update, f"📦 Bundle is {file_size / (1024 * 1024):.1f} MB. Uploading to external host...")
             download_url = await upload_to_external_host(output_path)
-            await send_text(update, f"\u2705 Export complete! Download link: {download_url}")
-        await status_msg.delete()
+            await send_text(update, f"✅ Export complete! Download link: {download_url}")
+        
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
     except Exception as exc:
         logger.exception("Bundle export failed")
-        await send_text(update, f"Bundle export failed: {exc}")
-        await status_msg.delete()
+        await send_text(update, f"❌ Bundle export failed: {exc}")
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    name, session = active_session(user_id)
+    
+    if not name:
+        await update.message.reply_text("❌ No active session. Use /session to create or switch one.")
+        return
+    
+    metadata = load_metadata(user_id, name)
+    bundle = metadata.get("bundle")
+    
+    status_text = (
+        f"📂 *Active Session:* `{name}`\n"
+        f"📦 *Bundle:* `{bundle if bundle else 'None'}`\n"
+        f"📅 *Created:* `{metadata.get('created_at', 'Unknown')}`\n"
+    )
+    
+    if bundle:
+        status_text += f"⬆️ *Uploaded:* `{metadata.get('uploaded_at', 'Unknown')}`"
+    
+    await update.message.reply_text(status_text, parse_mode="Markdown")
 
 async def replace_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -1246,6 +1275,7 @@ BOT_COMMANDS = [
     BotCommand("replace", "Batch-replace textures from a PNG zip"),
     BotCommand("replace_one", "Replace a single texture (reply to PNG)"),
     BotCommand("clear", "Clear cached files in the active session"),
+    BotCommand("status", "Show active session and bundle status"),
 ]
 
 
@@ -1272,6 +1302,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("replace", replace_command))
     application.add_handler(CommandHandler("replace_one", replace_one))
     application.add_handler(CommandHandler("clear", clear_session))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(MessageHandler(filters.Document.ALL, receive_document))
     # URL handler: detect links in text messages (must come after command handlers)
